@@ -899,6 +899,7 @@ def parse_options(argv=None):
         'max_views': opts.max_views,
         'daterange': opts.date,
         'cachedir': opts.cachedir,
+        'parse_cache': opts.parse_cache,
         'age_limit': opts.age_limit,
         'download_archive': opts.download_archive,
         'break_on_existing': opts.break_on_existing,
@@ -985,6 +986,10 @@ def _real_main(argv=None):
 
         if opts.rm_cachedir:
             ydl.cache.remove()
+
+        if opts.rm_expired_cache:
+            removed = ydl.extraction_cache.remove_expired()
+            ydl.to_screen(f'Removed {removed} expired cache entr{"y" if removed == 1 else "ies"}')
 
         try:
             updater = Updater(ydl, opts.update_self)

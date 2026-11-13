@@ -27,6 +27,7 @@ import urllib.parse
 import urllib.request
 
 from .cache import Cache
+from .extraction_cache import ExtractionCache
 from .compat import urllib_req_to_req
 from .cookies import CookieLoadError, LenientSimpleCookie, load_cookies
 from .downloader import FFmpegFD, get_suitable_downloader, shorten_protocol_name
@@ -334,6 +335,11 @@ class YoutubeDL:
     skip_download:     Skip the actual download of the video file
     cachedir:          Location of the cache files in the filesystem.
                        False to disable filesystem cache.
+    parse_cache:       Cache fully resolved parse (extraction) results on disk.
+                       The cache key covers the URL together with the requested
+                       quality (format), subtitle languages and audio-only mode,
+                       so changing any of them forces a fresh parse.  Entries
+                       expire 24 hours after they are written.
     noplaylist:        Download single video instead of a playlist if in doubt.
     age_limit:         An integer representing the user's age in years.
                        Unsuitable videos for the given age are skipped.
@@ -655,6 +661,7 @@ class YoutubeDL:
         self._playlist_level = 0
         self._playlist_urls = set()
         self.cache = Cache(self)
+        self.extraction_cache = ExtractionCache(self.cache)
         self.__header_cookies = []
 
         # compat for API: load plugins if they have not already
@@ -1670,6 +1677,40 @@ class YoutubeDL:
         for key, value in extra_info.items():
             info_dict.setdefault(key, value)
 
+    def _get_extraction_cache_params(self):
+        """Collect the parameters that influence the parsed result.
+
+        The cache key must include all of them so that re-parsing the same
+        URL with a different quality / subtitle language / audio-only setting
+        cannot return another setting's cached result.
+        """
+        return (
+            self.params.get('format'),
+            list(self.params.get('subtitleslangs') or []),
+            bool(self.params.get('extractaudio')),
+        )
+
+    def _load_extraction_cache(self, url):
+        if not self.params.get('parse_cache'):
+            return None
+        try:
+            return self.extraction_cache.load(url, *self._get_extraction_cache_params())
+        except Exception:
+            self.report_warning(f'Failed reading parse cache for {url}: {traceback.format_exc()}')
+            return None
+
+    def _store_extraction_cache(self, url, result):
+        if not self.params.get('parse_cache') or not isinstance(result, dict):
+            return
+        if result.get('_type', 'video') != 'video':
+            # Only cache fully resolved video results; playlists/URL refs are
+            # resolved recursively and must not be served from cache.
+            return
+        try:
+            self.extraction_cache.store(url, result, *self._get_extraction_cache_params())
+        except Exception:
+            self.report_warning(f'Failed writing parse cache for {url}: {traceback.format_exc()}')
+
     def extract_info(self, url, download=True, ie_key=None, extra_info=None,
                      process=True, force_generic_extractor=False):
         """
@@ -1694,6 +1735,14 @@ class YoutubeDL:
         if not ie_key and force_generic_extractor:
             ie_key = 'Generic'
 
+        # Serve fully resolved single-video parse results from the parameter
+        # aware cache.  Recursive / flat / playlist calls bypass the cache.
+        if process and not extra_info:
+            cached_result = self._load_extraction_cache(url)
+            if cached_result is not None:
+                self.to_screen(f'[cache] Using cached parse result for {url}')
+                return cached_result
+
         if ie_key:
             ies = {ie_key: self._ies[ie_key]} if ie_key in self._ies else {}
         else:
@@ -1714,7 +1763,10 @@ class YoutubeDL:
                 if self.params.get('break_on_existing', False):
                     raise ExistingVideoReached
                 break
-            return self.__extract_info(url, self.get_info_extractor(key), download, extra_info, process)
+            result = self.__extract_info(url, self.get_info_extractor(key), download, extra_info, process)
+            if process and not extra_info:
+                self._store_extraction_cache(url, result)
+            return result
         else:
             extractors_restricted = self.params.get('allowed_extractors') not in (None, ['default'])
             self.report_error(f'No suitable extractor{format_field(ie_key, None, " (%s)")} found for URL {url}',

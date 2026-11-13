@@ -1571,6 +1571,17 @@ def create_parser():
         '--rm-cache-dir',
         action='store_true', dest='rm_cachedir',
         help='Delete all filesystem cache files')
+    filesystem.add_option(
+        '--parse-cache',
+        action='store_true', dest='parse_cache', default=False,
+        help=(
+            'Cache parsed video info on disk. Entries are keyed by the URL together '
+            'with the requested quality, subtitle languages and audio-only mode, and '
+            'expire after 24 hours'))
+    filesystem.add_option(
+        '--rm-expired-cache',
+        action='store_true', dest='rm_expired_cache', default=False,
+        help='Delete expired filesystem cache entries (older than 24 hours)')
 
     thumbnail = optparse.OptionGroup(parser, 'Thumbnail Options')
     thumbnail.add_option(
