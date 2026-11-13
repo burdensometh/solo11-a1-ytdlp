@@ -11,12 +11,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from yt_dlp.globals import all_plugins_loaded
 
+import collections
 import contextlib
 import copy
 import json
 
 from test.helper import FakeYDL, try_rm
 from yt_dlp import YoutubeDL
+from yt_dlp.YoutubeDL import info_normalization_stats
 from yt_dlp.extractor.common import InfoExtractor
 from yt_dlp.postprocessor.common import PostProcessor
 from yt_dlp.utils import (
@@ -527,6 +529,103 @@ class TestFormatSelection(unittest.TestCase):
 
 
 class TestYoutubeDL(unittest.TestCase):
+    def test_normalize_info_types(self):
+        normalize = YoutubeDL.normalize_info_types
+
+        stats = collections.Counter()
+        info = normalize({
+            'id': 'test',
+            'duration': '1:23:45',
+            'timestamp': 1614952800,
+            'release_timestamp': '2021-03-05T14:00:00+02:00',
+            'modified_timestamp': 'not a timestamp',
+            'upload_date': '20210305',
+            'release_date': '20211345',
+        }, stats)
+        self.assertEqual(info['duration'], 5025)
+        self.assertEqual(info['timestamp'], '2021-03-05T14:00:00+00:00')
+        self.assertEqual(info['release_timestamp'], '2021-03-05T12:00:00+00:00')
+        self.assertIsNone(info['modified_timestamp'])
+        self.assertEqual(info['upload_date'], '2021-03-05')
+        self.assertIsNone(info['release_date'])
+        self.assertIsNone(info['modified_date'])
+        self.assertEqual(info['raw'], {
+            'duration': '1:23:45',
+            'timestamp': 1614952800,
+            'release_timestamp': '2021-03-05T14:00:00+02:00',
+            'modified_timestamp': 'not a timestamp',
+            'upload_date': '20210305',
+            'release_date': '20211345',
+        })
+        self.assertEqual(stats['invalid:modified_timestamp'], 1)
+        self.assertEqual(stats['invalid:release_date'], 1)
+        self.assertEqual(stats['missing:modified_date'], 1)
+        self.assertNotIn('invalid:duration', stats)
+
+        # Durations given as numbers or plain numeric strings become integer seconds
+        stats = collections.Counter()
+        self.assertEqual(normalize({'duration': 90}, stats)['duration'], 90)
+        self.assertEqual(normalize({'duration': 90.6}, stats)['duration'], 91)
+        self.assertEqual(normalize({'duration': '90'}, stats)['duration'], 90)
+        self.assertNotIn('invalid:duration', stats)
+
+        # Epoch timestamps given as strings are still recognized
+        info = normalize({'timestamp': '1614952800'}, collections.Counter())
+        self.assertEqual(info['timestamp'], '2021-03-05T14:00:00+00:00')
+
+        # Missing fields are written as null and counted, without adding a raw key
+        stats = collections.Counter()
+        info = normalize({'id': 'test'}, stats)
+        for field in ('duration', 'timestamp', 'release_timestamp', 'modified_timestamp',
+                      'upload_date', 'release_date', 'modified_date'):
+            self.assertIsNone(info[field], field)
+            self.assertEqual(stats[f'missing:{field}'], 1, field)
+        self.assertNotIn('raw', info)
+
+        # Nested entries are normalized and counted; requested_downloads are
+        # normalized as well, but not counted again since they duplicate the top-level info
+        stats = collections.Counter()
+        info = normalize({
+            'id': 'playlist',
+            'entries': [{'id': '1', 'duration': '10:00'}, {'id': '2'}],
+            'requested_downloads': [{'id': '1', 'duration': '10:00'}],
+        }, stats)
+        self.assertEqual(info['entries'][0]['duration'], 600)
+        self.assertEqual(info['entries'][0]['raw'], {'duration': '10:00'})
+        self.assertIsNone(info['entries'][1]['duration'])
+        self.assertEqual(info['requested_downloads'][0]['duration'], 600)
+        self.assertEqual(info['requested_downloads'][0]['raw'], {'duration': '10:00'})
+        self.assertEqual(stats['missing:duration'], 2)  # playlist itself and second entry only
+
+    def test_normalize_info_types_default_stats(self):
+        info_normalization_stats.clear()
+        YoutubeDL.normalize_info_types({'id': 'test'})
+        self.assertEqual(info_normalization_stats['missing:duration'], 1)
+        self.assertEqual(info_normalization_stats['missing:timestamp'], 1)
+        info_normalization_stats.clear()
+
+    def test_write_info_json_normalizes_types(self):
+        TEST_FILE = 'test_write_info_json.info.json'
+        ydl = FakeYDL()
+        ydl.process_info = lambda x: ydl._write_info_json('test', x, TEST_FILE)
+        ydl.process_ie_result({
+            'id': '1',
+            'title': 'x',
+            'url': TEST_URL,
+            'duration': 90.6,
+            'timestamp': 1614952800,
+            'upload_date': '20210305',
+        })
+        with open(TEST_FILE) as infojson:
+            written = json.load(infojson)
+        self.assertEqual(written['duration'], 91)
+        self.assertEqual(written['timestamp'], '2021-03-05T14:00:00+00:00')
+        self.assertEqual(written['upload_date'], '2021-03-05')
+        self.assertIsNone(written['release_date'])
+        self.assertEqual(written['raw']['duration'], 90.6)
+        self.assertEqual(written['raw']['timestamp'], 1614952800)
+        try_rm(TEST_FILE)
+
     def test_subtitles(self):
         def s_formats(lang, autocaption=False):
             return [{

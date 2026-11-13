@@ -804,7 +804,8 @@ class FFmpegMetadataPP(FFmpegPostProcessor):
             if not self._downloader._ensure_dir_exists(infofn):
                 return
             self.write_debug(f'Writing info-json to: {infofn}')
-            write_json_file(self._downloader.sanitize_info(info, self.get_param('clean_infojson', True)), infofn)
+            write_json_file(self._downloader.normalize_info_types(
+                self._downloader.sanitize_info(info, self.get_param('clean_infojson', True))), infofn)
             info['infojson_filename'] = infofn
 
         old_stream, new_stream = self.get_stream_number(info['filepath'], ('tags', 'mimetype'), 'application/json')

@@ -143,6 +143,7 @@ from .utils import (
     make_parent_dirs,
     orderedSet,
     orderedSet_from_options,
+    parse_duration,
     parse_filesize,
     preferredencoding,
     prepend_extension,
@@ -164,6 +165,7 @@ from .utils import (
     traverse_obj,
     try_call,
     try_get,
+    unified_timestamp,
     url_basename,
     variadic,
     windows_enable_vt_mode,
@@ -200,6 +202,78 @@ def _catch_unsafe_extension_error(func):
                 f'If you believe this is an error{bug_reports_message(",")}')
 
     return wrapper
+
+
+# Fields whose types are unified before an info dict is written out, so that downstream
+# consumers get a consistent schema regardless of what each extractor produced.
+# Durations become integer seconds, timestamps/dates become ISO 8601 strings,
+# missing fields are written as null (and counted), and the original values are
+# preserved under the "raw" key
+_NORMALIZE_DURATION_FIELDS = ('duration',)
+_NORMALIZE_TIMESTAMP_FIELDS = ('timestamp', 'release_timestamp', 'modified_timestamp')
+_NORMALIZE_DATE_FIELDS = ('upload_date', 'release_date', 'modified_date')
+
+# Running counts of fields that were missing or unparseable during normalization,
+# keyed as 'missing:<field>' / 'invalid:<field>'
+info_normalization_stats = collections.Counter()
+
+
+def _normalize_duration(value):
+    """ Duration as integer seconds, from a number of seconds or a string like '1:23:45' """
+    if isinstance(value, bool):
+        return None
+    elif isinstance(value, (int, float)):
+        seconds = value
+    elif isinstance(value, str):
+        seconds = parse_duration(value)
+    else:
+        return None
+    try:
+        return int(round(seconds))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _normalize_timestamp(value):
+    """ ISO 8601 datetime string, from a unix timestamp or a date/time string """
+    if isinstance(value, bool):
+        return None
+    elif isinstance(value, (int, float)):
+        timestamp = value
+    elif isinstance(value, str):
+        value = value.strip()
+        timestamp = float_or_none(value)
+        if timestamp is None:
+            timestamp = unified_timestamp(value)
+    else:
+        return None
+    try:
+        return dt.datetime.fromtimestamp(timestamp, tz=dt.timezone.utc).isoformat()
+    except (TypeError, OverflowError, OSError, ValueError):
+        return None
+
+
+def _normalize_date(value):
+    """ ISO 8601 date string, from a YYYYMMDD string, a date string or a unix timestamp """
+    if isinstance(value, bool):
+        return None
+    elif isinstance(value, (int, float)):
+        timestamp = value
+    elif isinstance(value, str):
+        value = value.strip()
+        ymd = re.fullmatch(r'(\d{4})(\d{2})(\d{2})', value)
+        if ymd:
+            try:
+                return dt.date(*map(int, ymd.groups())).isoformat()
+            except ValueError:
+                return None
+        timestamp = unified_timestamp(value)
+    else:
+        return None
+    try:
+        return dt.datetime.fromtimestamp(timestamp, tz=dt.timezone.utc).date().isoformat()
+    except (TypeError, OverflowError, OSError, ValueError):
+        return None
 
 
 class YoutubeDL:
@@ -3279,7 +3353,7 @@ class YoutubeDL:
         print_field('format')
 
         if self.params.get('forcejson'):
-            self.to_stdout(json.dumps(self.sanitize_info(info_dict)))
+            self.to_stdout(json.dumps(self.normalize_info_types(self.sanitize_info(info_dict))))
 
     def dl(self, name, info, subtitle=False, test=False):
         if not info.get('url'):
@@ -3693,7 +3767,7 @@ class YoutubeDL:
             else:
                 if self.params.get('dump_single_json', False):
                     self.post_extract(res)
-                    self.to_stdout(json.dumps(self.sanitize_info(res)))
+                    self.to_stdout(json.dumps(self.normalize_info_types(self.sanitize_info(res))))
         return wrapper
 
     def download(self, url_list):
@@ -3775,6 +3849,55 @@ class YoutubeDL:
     def filter_requested_info(info_dict, actually_filter=True):
         """ Alias of sanitize_info for backward compatibility """
         return YoutubeDL.sanitize_info(info_dict, actually_filter)
+
+    @staticmethod
+    def normalize_info_types(info_dict, stats=None):
+        """ Unify the types of the canonical duration/time fields of a sanitized info dict.
+
+        Durations are converted to integer seconds and timestamps/dates to ISO 8601
+        strings. Fields that are missing are written as null and counted; values that
+        cannot be parsed are nulled and counted. The original values are preserved
+        under the "raw" key. To be applied to the result of sanitize_info before
+        writing it out; the input dict is modified in place.
+        """
+        if stats is None:
+            stats = info_normalization_stats
+        if not isinstance(info_dict, dict):
+            return info_dict
+
+        raw = {}
+        for fields, converter in (
+            (_NORMALIZE_DURATION_FIELDS, _normalize_duration),
+            (_NORMALIZE_TIMESTAMP_FIELDS, _normalize_timestamp),
+            (_NORMALIZE_DATE_FIELDS, _normalize_date),
+        ):
+            for field in fields:
+                original = info_dict.get(field)
+                if original is None:
+                    stats[f'missing:{field}'] += 1
+                    info_dict[field] = None
+                    continue
+                raw[field] = original
+                converted = converter(original)
+                if converted is None:
+                    stats[f'invalid:{field}'] += 1
+                info_dict[field] = converted
+
+        if raw:
+            existing = info_dict.get('raw')
+            info_dict['raw'] = {**existing, **raw} if isinstance(existing, dict) else raw
+
+        entries = info_dict.get('entries')
+        if isinstance(entries, (list, tuple)):
+            info_dict['entries'] = [YoutubeDL.normalize_info_types(entry, stats) for entry in entries]
+        # requested_downloads duplicates the top-level info, so normalize it with a
+        # throwaway counter to avoid counting the same fields twice
+        requested = info_dict.get('requested_downloads')
+        if isinstance(requested, (list, tuple)):
+            info_dict['requested_downloads'] = [
+                YoutubeDL.normalize_info_types(entry, collections.Counter()) for entry in requested]
+
+        return info_dict
 
     def _delete_downloaded_files(self, *files_to_delete, info={}, msg=None):
         for filename in set(filter(None, files_to_delete)):
@@ -4412,7 +4535,8 @@ class YoutubeDL:
 
         self.to_screen(f'[info] Writing {label} metadata as JSON to: {infofn}')
         try:
-            write_json_file(self.sanitize_info(ie_result, self.params.get('clean_infojson', True)), infofn)
+            write_json_file(self.normalize_info_types(
+                self.sanitize_info(ie_result, self.params.get('clean_infojson', True))), infofn)
             return True
         except OSError:
             self.report_error(f'Cannot write {label} metadata to JSON file {infofn}')
